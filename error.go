@@ -5,9 +5,10 @@ import (
 )
 
 type NotificationError struct {
-	Command    uint8
-	Status     uint8
-	Identifier uint32
+	Command      uint8
+	Status       uint8
+	Identifier   uint32
+	Notification *Notification
 
 	OtherError error
 }
@@ -58,7 +59,7 @@ func (e NotificationError) Error() string {
 	default:
 		status = "None (unknown)"
 	}
-	return fmt.Sprintf("%s(%d): id(%x)", status, e.Status, e.Identifier)
+	return fmt.Sprintf("%s: id(%x),token(%s)", status, e.Identifier, e.Notification.DeviceToken)
 }
 
 func (e NotificationError) String() string {

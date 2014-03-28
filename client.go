@@ -3,11 +3,12 @@ package apns
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
-	"time"
+	"sync"
 )
 
-func NewClient(server, certFilename, keyFilename string, timeout time.Duration) (*Client, error) {
+func NewClient(server, certFilename, keyFilename string) (*Client, error) {
 
 	cert, err := tls.LoadX509KeyPair(certFilename, keyFilename)
 	if err != nil {
@@ -20,12 +21,9 @@ func NewClient(server, certFilename, keyFilename string, timeout time.Duration) 
 	}
 
 	c := &Client{
-		server:  server,
-		conf:    conf,
-		timeout: timeout,
+		server: server,
+		conf:   conf,
 	}
-
-	err = c.connect()
 
 	if err != nil {
 		return nil, err
@@ -33,19 +31,58 @@ func NewClient(server, certFilename, keyFilename string, timeout time.Duration) 
 
 	c.queue = make(chan *Notification, 1000)
 	c.errors = make(chan *NotificationError, 1000)
+	c.buffer = make([]*Notification, IDENTIFIER_UBOUND+1)
+	c.lock = new(sync.Mutex)
 	c.sendLoop()
-	c.readErrors()
 	return c, err
 }
 
 type Client struct {
-	server  string
-	conf    *tls.Config
-	conn    *tls.Conn
-	timeout time.Duration
+	server string
+	conf   *tls.Config
+	conn   *tls.Conn
 
 	queue  chan *Notification
 	errors chan *NotificationError
+	buffer []*Notification
+	lock   *sync.Mutex
+	lastId uint32
+}
+
+func (c *Client) Connect() error {
+
+	err := c.Close()
+	if err != nil {
+		return fmt.Errorf("close last connection failed: %s", err)
+	}
+
+	conn, err := net.Dial("tcp", c.server)
+	if err != nil {
+		return fmt.Errorf("connect to server error: %s", err)
+	}
+
+	c.conn = tls.Client(conn, c.conf)
+	err = c.conn.Handshake()
+	if err != nil {
+		return fmt.Errorf("handshake server error: %s", err)
+	}
+
+	c.readErrors()
+
+	return nil
+
+}
+
+func (c *Client) Close() error {
+
+	if c.conn == nil {
+		return nil
+	}
+
+	conn := c.conn
+	c.conn = nil
+	return conn.Close()
+
 }
 
 func (c *Client) Send(n *Notification) {
@@ -58,52 +95,37 @@ func (c *Client) GetError() *NotificationError {
 	return <-c.errors
 }
 
-func (c *Client) connect() error {
-
-	err := c.close()
-	if err != nil {
-		return fmt.Errorf("close last connection failed: %s", err)
-	}
-
-	conn, err := net.Dial("tcp", c.server)
-	if err != nil {
-		return fmt.Errorf("connect to server error: %d", err)
-	}
-
-	c.conn = tls.Client(conn, c.conf)
-	err = c.conn.Handshake()
-	if err != nil {
-		return fmt.Errorf("handshake server error: %s", err)
-	}
-
-	return nil
-
-}
-
-func (c *Client) close() error {
-
-	if c.conn == nil {
-		return nil
-	}
-
-	conn := c.conn
-	c.conn = nil
-	return conn.Close()
-
-}
-
 func (c *Client) sendLoop() {
 
 	go func() {
 
 		for {
-			n := <-c.queue
 
-			err := c.send(n)
+			n := <-c.queue
+			c.lock.Lock()
+
+			c.buffer[n.Identifier] = n
+
+			var err error
+
+			for i := 0; i < 3; i++ {
+
+				log.Printf("SEND (%d):%d-%s\n", i, n.Identifier, n.DeviceToken)
+
+				err := c.send(n)
+
+				if err == nil {
+					break
+				}
+				c.Connect()
+			}
 
 			if err != nil {
-				c.errors <- NewNotificationError([]byte("123"), err)
+				log.Printf("ERROR send error with retry:%s-%s\n", n.DeviceToken, err)
 			}
+
+			c.lastId = n.Identifier
+			c.lock.Unlock()
 
 		}
 	}()
@@ -113,68 +135,80 @@ func (c *Client) sendLoop() {
 func (c *Client) send(n *Notification) error {
 
 	if c.conn == nil {
-		return fmt.Errorf("apns is not connected")
+		return fmt.Errorf("Apns is not connected")
 	}
 
 	bytes, err := n.ToBytes()
 
 	if err != nil {
-		return fmt.Errorf("notification to byte error: %s", err)
+		return fmt.Errorf("Notification to byte error: %s", err)
 	}
 
 	_, err = c.conn.Write(bytes)
 	if err != nil {
-		return fmt.Errorf("write socket error: %s", err)
+		return fmt.Errorf("Write socket error: %s", err)
 	}
 
 	return nil
 
 }
 
-func (c *Client) readErrors() {
+func (c *Client) putBackToQueue(i uint32) {
 
-	go func() {
-		p := make([]byte, 8)
-		num, err := c.conn.Read(p)
-		e := NewNotificationError(p[:num], err)
-		c.connect()
-		c.errors <- e
-	}()
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.Close()
+
+	var retry []*Notification
+	if c.lastId < i {
+		retry = c.buffer[:c.lastId+1]
+
+		for _, v := range retry {
+			if v != nil {
+				v.Identifier = GetIdentifier()
+				c.Send(v)
+			}
+
+		}
+
+	}
+
+	retry = c.buffer[i+1:]
+
+	for _, v := range retry {
+		if v != nil {
+			v.Identifier = GetIdentifier()
+			c.Send(v)
+		}
+
+	}
+
+	c.buffer = make([]*Notification, IDENTIFIER_UBOUND+1)
 
 }
 
-//单条发送测试
-// func (c *Client) SendSync(n *Notification) error {
+func (c *Client) readErrors() {
 
-// 	if c.conn == nil {
-// 		err := c.Connect()
+	go func() {
 
-// 		if err != nil {
-// 			return err
-// 		}
-// 	}
+		// if c.conn != nil {
 
-// 	bytes, err := n.ToBytes()
+		p := make([]byte, 8)
+		num, err := c.conn.Read(p)
 
-// 	if err != nil {
-// 		return fmt.Errorf("notification to byte error: %s", err)
-// 	}
+		if err != nil {
+			log.Println("ERROR read:", err)
+			c.lock.Lock()
+			defer c.lock.Unlock()
+			c.Connect()
+		} else {
+			e := NewNotificationError(p[:num], err)
+			e.Notification = c.buffer[e.Identifier]
+			c.putBackToQueue(e.Identifier)
+			c.errors <- e
+		}
+		// }
 
-// 	_, err = c.conn.Write(bytes)
-// 	if err != nil {
-// 		return fmt.Errorf("write socket error: %s", err)
-// 	}
+	}()
 
-// 	p := make([]byte, 8)
-
-// 	c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-// 	num, err := c.conn.Read(p)
-// 	neterr, ok := err.(net.Error)
-// 	if ok && neterr.Timeout() {
-// 		return nil // timeout isn't an error in this case
-// 	}
-
-// 	e := NewNotificationError(p[:num], err)
-// 	return e
-
-// }
+}

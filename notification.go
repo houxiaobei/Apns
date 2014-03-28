@@ -6,9 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"math/rand"
 	"strconv"
-	"time"
 )
 
 // Push commands always start with command value 1.
@@ -20,7 +18,38 @@ const MAX_PAYLOAD_SIZE_BYTES = 256
 // Every push notification gets a pseudo-unique identifier;
 // this establishes the upper boundary for it. Apple will return
 // this identifier if there is an issue sending your notification.
-const IDENTIFIER_UBOUND = 9999
+const IDENTIFIER_UBOUND = 99999
+
+var identifier chan uint32
+
+// init
+func init() {
+	identifier = make(chan uint32, IDENTIFIER_UBOUND)
+	go genIdentifier()
+}
+
+// return notification identifier
+func GetIdentifier() uint32 {
+	return <-identifier
+}
+
+// auto gen notification identifier
+func genIdentifier() {
+
+	var id uint32 = 0
+
+	for {
+
+		if id > IDENTIFIER_UBOUND {
+			id = 0
+		}
+
+		identifier <- id
+
+		id++
+	}
+
+}
 
 // Alert is an interface here because it supports either a string
 // or a dictionary, represented within by an AlertDictionary struct.
@@ -53,7 +82,7 @@ func NewAlertDictionary() *AlertDictionary {
 // The Notification is the wrapper for the Payload.
 // The length fields are computed in ToBytes() and aren't represented here.
 type Notification struct {
-	Identifier  int32
+	Identifier  uint32
 	Expiry      uint32
 	DeviceToken string
 	payload     map[string]interface{}
@@ -63,7 +92,7 @@ type Notification struct {
 func NewNotification() (n *Notification) {
 	n = new(Notification)
 	n.payload = make(map[string]interface{})
-	n.Identifier = rand.New(rand.NewSource(time.Now().UnixNano())).Int31n(IDENTIFIER_UBOUND)
+	n.Identifier = GetIdentifier()
 	return
 }
 
