@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync"
 )
 
 func NewClient(server, certFilename, keyFilename string) (*Client, error) {
@@ -32,7 +31,6 @@ func NewClient(server, certFilename, keyFilename string) (*Client, error) {
 	c.queue = make(chan *Notification, 1000)
 	c.errors = make(chan *NotificationError, 1000)
 	c.buffer = make([]*Notification, IDENTIFIER_UBOUND+1)
-	c.lock = new(sync.Mutex)
 	c.sendLoop()
 	return c, err
 }
@@ -45,8 +43,6 @@ type Client struct {
 	queue  chan *Notification
 	errors chan *NotificationError
 	buffer []*Notification
-	lock   *sync.Mutex
-	lastId uint32
 }
 
 func (c *Client) Connect() error {
@@ -102,10 +98,6 @@ func (c *Client) sendLoop() {
 		for {
 
 			n := <-c.queue
-			c.lock.Lock()
-
-			c.buffer[n.Identifier] = n
-
 			var err error
 
 			for i := 0; i < 3; i++ {
@@ -123,10 +115,6 @@ func (c *Client) sendLoop() {
 			if err != nil {
 				log.Printf("ERROR send error with retry:%s-%s\n", n.DeviceToken, err)
 			}
-
-			c.lastId = n.Identifier
-			c.lock.Unlock()
-
 		}
 	}()
 
@@ -153,61 +141,23 @@ func (c *Client) send(n *Notification) error {
 
 }
 
-func (c *Client) putBackToQueue(i uint32) {
-
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	c.Close()
-
-	var retry []*Notification
-	if c.lastId < i {
-		retry = c.buffer[:c.lastId+1]
-
-		for _, v := range retry {
-			if v != nil {
-				v.Identifier = GetIdentifier()
-				c.Send(v)
-			}
-
-		}
-
-	}
-
-	retry = c.buffer[i+1:]
-
-	for _, v := range retry {
-		if v != nil {
-			v.Identifier = GetIdentifier()
-			c.Send(v)
-		}
-
-	}
-
-	c.buffer = make([]*Notification, IDENTIFIER_UBOUND+1)
-
-}
-
 func (c *Client) readErrors() {
 
 	go func() {
 
-		// if c.conn != nil {
+		if c.conn != nil {
 
-		p := make([]byte, 8)
-		num, err := c.conn.Read(p)
+			p := make([]byte, 8)
+			num, err := c.conn.Read(p)
 
-		if err != nil {
-			log.Println("ERROR read:", err)
-			c.lock.Lock()
-			defer c.lock.Unlock()
-			c.Connect()
-		} else {
-			e := NewNotificationError(p[:num], err)
-			e.Notification = c.buffer[e.Identifier]
-			c.putBackToQueue(e.Identifier)
-			c.errors <- e
+			if err != nil {
+				log.Println("ERROR read:", err)
+				c.Connect()
+			} else {
+				e := NewNotificationError(p[:num], err)
+				c.errors <- e
+			}
 		}
-		// }
 
 	}()
 
